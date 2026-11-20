@@ -95,11 +95,7 @@ fn auto_forward_address(env: &Env, recipient: &Address) -> Address {
 }
 
 fn cumulative_deposited(env: &Env, info: &StreamInfo) -> Result<i128, Error> {
-    if let Some(total) = env
-        .storage()
-        .instance()
-        .get(&DataKey::CumulativeDeposited)
-    {
+    if let Some(total) = env.storage().instance().get(&DataKey::CumulativeDeposited) {
         return Ok(total);
     }
 
@@ -380,9 +376,7 @@ impl DripStream {
         );
 
         if let Some(uri) = metadata_uri {
-            env.storage()
-                .persistent()
-                .set(&DataKey::MetadataUri, &uri);
+            env.storage().persistent().set(&DataKey::MetadataUri, &uri);
             drip_common::ttl::bump_persistent(&env, &DataKey::MetadataUri);
         }
 
@@ -409,6 +403,7 @@ impl DripStream {
         }
         ttl::bump(env);
         ttl::extend_on_activity(env);
+        ttl::extend_persistent_on_activity(env);
 
         let info = state::load(env);
         state::assert_not_cancelled(&info)?;
@@ -485,8 +480,7 @@ impl DripStream {
         // Perform the transfer, then derive `remaining` from the single balance
         let split_opt: Option<SplitConfig> = env.storage().instance().get(&DataKey::SplitConfig);
         if let Some(split) = split_opt {
-            let secondary_amount =
-                math::mul_div(env, to_send, split.split_bps as u128, 10_000)?;
+            let secondary_amount = math::mul_div(env, to_send, split.split_bps as u128, 10_000)?;
             let primary_amount = to_send
                 .checked_sub(secondary_amount)
                 .ok_or(Error::ArithmeticOverflow)?;
@@ -1550,8 +1544,7 @@ impl DripStream {
 
         let split_opt: Option<SplitConfig> = env.storage().instance().get(&DataKey::SplitConfig);
         if let Some(split) = split_opt {
-            let secondary_amount =
-                math::mul_div(&env, to_send, split.split_bps as u128, 10_000)?;
+            let secondary_amount = math::mul_div(&env, to_send, split.split_bps as u128, 10_000)?;
             to_send
                 .checked_sub(secondary_amount)
                 .ok_or(Error::ArithmeticOverflow)?;
@@ -1716,9 +1709,13 @@ impl DripStream {
         let mut updated = info.clone();
         updated.recipient = new_recipient.clone();
         state::save(env, &updated);
-        env.storage().instance().remove(&DataKey::AutoForwardAddress);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AutoForwardAddress);
         env.storage().instance().remove(&DataKey::RecoveryAddress);
-        env.storage().instance().remove(&DataKey::RecoveryClaimableAt);
+        env.storage()
+            .instance()
+            .remove(&DataKey::RecoveryClaimableAt);
         events::recipient_transferred(env, &info.recipient, &new_recipient);
         Ok(())
     }
@@ -1804,9 +1801,13 @@ impl DripStream {
             updated.recipient = new_recipient.clone();
             state::save(env, &updated);
 
-            env.storage().instance().remove(&DataKey::AutoForwardAddress);
+            env.storage()
+                .instance()
+                .remove(&DataKey::AutoForwardAddress);
             env.storage().instance().remove(&DataKey::RecoveryAddress);
-            env.storage().instance().remove(&DataKey::RecoveryClaimableAt);
+            env.storage()
+                .instance()
+                .remove(&DataKey::RecoveryClaimableAt);
 
             events::recipient_transferred(env, &old_recipient, &new_recipient);
             Ok(())
@@ -1828,7 +1829,9 @@ impl DripStream {
                 return Err(Error::InvalidRecipient);
             }
             if address == info.recipient {
-                env.storage().instance().remove(&DataKey::AutoForwardAddress);
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::AutoForwardAddress);
             } else {
                 env.storage()
                     .instance()
@@ -2162,7 +2165,9 @@ impl DripStream {
         caller.require_auth();
         ttl::bump(&env);
 
-        env.storage().instance().set(&DataKey::InvoiceMetadataUri, &uri);
+        env.storage()
+            .instance()
+            .set(&DataKey::InvoiceMetadataUri, &uri);
         Ok(())
     }
 
@@ -2177,7 +2182,9 @@ impl DripStream {
         caller.require_auth();
         ttl::bump(&env);
 
-        env.storage().instance().set(&DataKey::MilestoneMetadataUri, &uri);
+        env.storage()
+            .instance()
+            .set(&DataKey::MilestoneMetadataUri, &uri);
         Ok(())
     }
 
@@ -2467,13 +2474,27 @@ impl DripStream {
     /// Helper to set stream cancelability (Issue #685).
     pub fn set_cancelable(env: Env, caller: Address, is_cancelable: bool) -> Result<(), Error> {
         let memo = Self::stream_config(env.clone()).and_then(|c| c.memo);
-        Self::set_stream_config(env, caller, StreamConfig { is_cancelable, memo })
+        Self::set_stream_config(
+            env,
+            caller,
+            StreamConfig {
+                is_cancelable,
+                memo,
+            },
+        )
     }
 
     /// Helper to set stream beneficiary memo for accounting reconciliations (Issue #803).
     pub fn set_memo(env: Env, caller: Address, memo: Option<String>) -> Result<(), Error> {
         let is_cancelable = Self::is_cancelable(env.clone());
-        Self::set_stream_config(env, caller, StreamConfig { is_cancelable, memo })
+        Self::set_stream_config(
+            env,
+            caller,
+            StreamConfig {
+                is_cancelable,
+                memo,
+            },
+        )
     }
 
     /// Read-only: get the configured stream cancellation config, if any (Issues #685, #803).
