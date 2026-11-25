@@ -92,29 +92,59 @@ pub fn withdrawn(
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultWithdrawal {
+    pub token: Address,
     pub recipient: Address,
     pub amount: i128,
     pub previous_balance: i128,
     pub new_balance: i128,
+    pub timestamp: u64,
+}
+
+/// Event data payload for a token-aware vault deposit (Issue #950).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultDeposit {
+    pub token: Address,
+    pub from: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+/// Emitted by `deposit_token` after tokens are moved into the vault (Issue #950).
+///
+/// Topics: `("VaultDeposit", from)`
+/// Data:   `VaultDeposit { token, from, amount, timestamp }`
+pub fn vault_deposit(env: &Env, from: &Address, token: &Address, amount: i128) {
+    let payload = VaultDeposit {
+        token: token.clone(),
+        from: from.clone(),
+        amount,
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events()
+        .publish((Symbol::new(env, "VaultDeposit"), from.clone()), payload);
 }
 
 /// Emitted on withdrawal to publish balance before and after for off-chain accounting (Issue #758).
 ///
 /// Topics: `("VaultWithdrawal", caller, recipient)`
-/// Data:   `VaultWithdrawal { recipient, amount, previous_balance, new_balance }`
+/// Data:   `VaultWithdrawal { token, recipient, amount, previous_balance, new_balance, timestamp }`
 pub fn vault_withdrawal(
     env: &Env,
     caller: &Address,
+    token: &Address,
     recipient: &Address,
     amount: i128,
     previous_balance: i128,
     new_balance: i128,
 ) {
     let payload = VaultWithdrawal {
+        token: token.clone(),
         recipient: recipient.clone(),
         amount,
         previous_balance,
         new_balance,
+        timestamp: env.ledger().timestamp(),
     };
     env.events().publish(
         (Symbol::new(env, "VaultWithdrawal"), caller.clone(), recipient.clone()),
@@ -292,6 +322,24 @@ pub fn vault_deposit_failed(env: &Env, from: &Address, token: &Address, amount: 
 pub fn token_approval_changed(env: &Env, token: &Address, approved: bool) {
     env.events()
         .publish((symbol_short!("tok_allow"), token.clone()), approved);
+}
+
+pub fn strategy_approval_changed(env: &Env, strategy: &Address, approved: bool) {
+    env.events()
+        .publish((symbol_short!("strat_ok"), strategy.clone()), approved);
+}
+
+pub fn swept_to_strategy(
+    env: &Env,
+    caller: &Address,
+    token: &Address,
+    strategy: &Address,
+    amount: i128,
+) {
+    env.events().publish(
+        (symbol_short!("swept"), token.clone(), strategy.clone()),
+        (caller.clone(), amount),
+    );
 }
 
 pub fn vault_keys_refreshed(env: &Env, count: u32) {

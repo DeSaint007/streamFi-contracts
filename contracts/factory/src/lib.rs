@@ -21,7 +21,7 @@ use drip_common::is_zero_address;
 use drip_common::pause::PauseFlags;
 
 pub use errors::Error;
-pub use governance::{FeeUpdateProposal, WasmVersionInfo};
+pub use governance::{FeeCollectorUpdateProposal, FeeUpdateProposal, WasmVersionInfo};
 pub use pause::PauseType;
 use storage::DataKey;
 pub use storage::{
@@ -84,6 +84,9 @@ fn read_stream_count(env: &Env) -> u64 {
 }
 #[contract]
 pub struct DripFactory;
+
+/// Most recent stream ids scanned by `get_streams_by_ledger_range` in one call (#956).
+const MAX_LEDGER_RANGE_SCAN: u32 = 500;
 
 #[contractimpl]
 impl DripFactory {
@@ -388,8 +391,17 @@ impl DripFactory {
             metadata.into_val(&env),
         ];
 
-        let stream_addr = match deploy::deploy_stream(&env, &wasm_hash, stream_id, init_args) {
-            Ok(addr) => addr,
+        // The salt is derived from sender, recipient, a per-sender nonce and token (#957).
+        let (stream_addr, salt) = match deploy::deploy_stream(
+            &env,
+            &wasm_hash,
+            stream_id,
+            &sender,
+            &recipient,
+            &token,
+            init_args,
+        ) {
+            Ok(pair) => pair,
             Err(e) => {
                 env.storage().instance().set(&DataKey::CreateLock, &false);
                 return Err(e);
@@ -405,7 +417,6 @@ impl DripFactory {
         }
 
         // Emit StreamCreated event including salt and wasm_hash (Issue #684)
-        let salt = deploy::compute_salt(&env, stream_id);
         events::stream_created(&env, &sender, &recipient, &stream_addr, &salt, &wasm_hash);
 
         // ── Index ─────────────────────────────────────────────────────────
@@ -413,6 +424,15 @@ impl DripFactory {
         // they use persistent storage (not instance storage) to avoid hitting
         // instance storage size limits as the protocol scales.
         //
+        // Deployment ledger for `get_streams_by_ledger_range` (#956).
+        env.storage()
+            .persistent()
+            .set(&DataKey::StreamLedger(stream_id), &env.ledger().sequence());
+        env.storage().persistent().extend_ttl(
+            &DataKey::StreamLedger(stream_id),
+            ttl::THRESHOLD,
+            ttl::EXTEND_TO,
+        );
         // Persistent storage entry 1 — StreamAddr:
         //   Key:   DataKey::StreamAddr(stream_id)
         //          XDR serialization: [discriminant: u32][stream_id: u64]
@@ -460,6 +480,8 @@ impl DripFactory {
         env.storage()
             .instance()
             .set(&DataKey::Aggregate, &aggregate);
+        // Keep the persistent active-stream count in step (#960).
+        storage::increment_active_stream_count(&env);
 
         // Persistent storage entry 2 — BySender (paged):
         //   Key:   DataKey::BySenderPage(sender, page)
@@ -748,6 +770,7 @@ impl DripFactory {
                 env.storage()
                     .instance()
                     .set(&DataKey::Aggregate, &aggregate);
+                storage::decrement_active_stream_count(&env);
             }
         }
 
@@ -841,6 +864,14 @@ impl DripFactory {
         env.storage()
             .instance()
             .set(&DataKey::Aggregate, &aggregate);
+        storage::decrement_active_stream_count(&env);
+    }
+
+    /// Paged list of every stream address this factory deployed, in creation
+    /// order (#959). `offset` is the first stream ID to read; `limit` is clamped
+    /// to the query's maximum page size.
+    pub fn get_all_streams(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        query::get_streams_paged(&env, offset, limit)
     }
     /// Paginated list of stream IDs created by `sender`, paired with the
     /// sender's total stream count.
@@ -1059,6 +1090,47 @@ impl DripFactory {
     /// As a maintenance operation, this also drives the bounded TTL walker
     /// so the persistent-by-ID registry stays alive during protocol-upgrade
     /// activity even if no `create_stream` calls happen between upgrades.
+    /// #956: stream contracts deployed at a ledger in `start_ledger..=end_ledger`, in stream-id order.
+    ///
+    /// Scans only the most recent `MAX_LEDGER_RANGE_SCAN` stream ids, so each call costs a bounded
+    /// number of reads. Older streams are outside the scanned window and are not returned, and
+    /// streams deployed before ledger tracking have no record and are never returned.
+    pub fn get_streams_by_ledger_range(
+        env: Env,
+        start_ledger: u32,
+        end_ledger: u32,
+    ) -> Result<Vec<Address>, Error> {
+        if start_ledger > end_ledger {
+            return Err(Error::InvalidTimeRange);
+        }
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StreamCount)
+            .unwrap_or(0);
+        let scan_from = count
+            .saturating_sub(MAX_LEDGER_RANGE_SCAN as u64)
+            .saturating_add(1);
+        let mut out: Vec<Address> = Vec::new(&env);
+        let mut id = scan_from;
+        while id <= count {
+            let deployed: Option<u32> = env.storage().persistent().get(&DataKey::StreamLedger(id));
+            if let Some(ledger) = deployed {
+                if ledger >= start_ledger && ledger <= end_ledger {
+                    if let Some(addr) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, Address>(&DataKey::StreamAddr(id))
+                    {
+                        out.push_back(addr);
+                    }
+                }
+            }
+            id += 1;
+        }
+        Ok(out)
+    }
+
     pub fn upgrade_stream_wasm(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         deploy::set_stream_wasm_hash(&env, &new_wasm_hash)
     }
@@ -1304,6 +1376,42 @@ impl DripFactory {
     /// Read-only: get pending fee update proposal, if any (Issue #766).
     pub fn pending_fee_update(env: Env) -> Option<governance::FeeUpdateProposal> {
         governance::pending_fee_update(&env)
+    }
+
+    /// Proposes a protocol fee collector update subject to MIN_DELAY timelock (Issue #905).
+    pub fn propose_fee_collector_update(env: Env, proposed_collector: Address) -> Result<u32, Error> {
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorAddress)
+            .ok_or(Error::NotInitialized)?;
+        governor.require_auth();
+        ttl::bump_instance(&env);
+        governance::propose_fee_collector_update(&env, &proposed_collector)
+    }
+
+    /// Executes a pending protocol fee collector update after MIN_DELAY ledgers have elapsed (Issue #905).
+    pub fn execute_fee_collector_update(env: Env) -> Result<(), Error> {
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorAddress)
+            .ok_or(Error::NotInitialized)?;
+        governor.require_auth();
+        ttl::bump_instance(&env);
+        governance::execute_fee_collector_update(&env)
+    }
+
+    /// Read-only: get pending fee collector update proposal, if any (Issue #905).
+    pub fn pending_fee_collector_update(env: Env) -> Option<governance::FeeCollectorUpdateProposal> {
+        governance::pending_fee_collector_update(&env)
+    }
+
+    /// Read-only: get current protocol fee collector address, if any (Issue #905).
+    pub fn fee_collector(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeCollectorAddress)
     }
 
     /// Read-only: cumulative protocol fee volume collected for a given token (Issue #768).

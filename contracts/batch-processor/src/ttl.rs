@@ -9,9 +9,67 @@
 /// Without this bump a deployed processor that goes quiet between payouts
 /// would eventually be archived (the exposure `docs/security.md` Known
 /// Limitation #1 tracks), and every later batch would need a restore first.
-use soroban_sdk::{contracttype, token, Address, Env};
+use soroban_sdk::{contracttype, token, Address, Env, Symbol, Vec};
 
 pub use drip_common::ttl::bump_instance as bump;
+
+/// Protocol maximum entry TTL (6_312_000 ledgers, ~1 year at 5s/ledger).
+pub const MAX_TTL_LEDGERS: u32 = 6_312_000;
+
+/// Compute the adaptive TTL bump amount from the maximum target expiration
+/// ledger across a batch: `max(target_ledgers) - current_ledger`, clamped to
+/// `[EXTEND_TTL_LEDGERS, MAX_TTL_LEDGERS]` (#889).
+pub fn compute_adaptive_bump_amount(current_ledger: u32, target_ledgers: &Vec<u32>) -> u32 {
+    let mut max_target: u32 = 0;
+    for target in target_ledgers.iter() {
+        if target > max_target {
+            max_target = target;
+        }
+    }
+
+    if max_target > current_ledger {
+        let delta = max_target - current_ledger;
+        delta.clamp(drip_common::ttl::EXTEND_TTL_LEDGERS, MAX_TTL_LEDGERS)
+    } else {
+        drip_common::ttl::EXTEND_TTL_LEDGERS
+    }
+}
+
+/// Extend batch processor instance and active temporary state TTL using an
+/// explicit list of target stream expiration ledgers (#889).
+pub fn bump_adaptive_from_ledgers(env: &Env, target_ledgers: &Vec<u32>) -> u32 {
+    let current_ledger = env.ledger().sequence();
+    let bump_amount = compute_adaptive_bump_amount(current_ledger, target_ledgers);
+    let min_ttl = (bump_amount / 2)
+        .max(drip_common::ttl::MIN_TTL_LEDGERS)
+        .min(bump_amount);
+    env.storage().instance().extend_ttl(min_ttl, bump_amount);
+    if env.storage().temporary().has(&crate::DataKey::ReentrancyLock) {
+        env.storage()
+            .temporary()
+            .extend_ttl(&crate::DataKey::ReentrancyLock, min_ttl, bump_amount);
+    }
+    bump_amount
+}
+
+/// Inspect expiration ledger sequences across `stream_ids` (via each stream's
+/// `expiration_ledger` view) and adaptively bump the processor's TTL to at
+/// least `max(target_ledgers) - current_ledger` (#889).
+pub fn bump_adaptive_for_streams(env: &Env, stream_ids: &Vec<Address>) -> u32 {
+    let mut target_ledgers = Vec::new(env);
+    let fn_name = Symbol::new(env, "expiration_ledger");
+    for stream_id in stream_ids.iter() {
+        let res = env.try_invoke_contract::<u32, soroban_sdk::Error>(
+            &stream_id,
+            &fn_name,
+            Vec::new(env),
+        );
+        if let Ok(Ok(target_ledger)) = res {
+            target_ledgers.push_back(target_ledger);
+        }
+    }
+    bump_adaptive_from_ledgers(env, &target_ledgers)
+}
 
 /// Automated key and instance TTL extension helpers (Issue #762).
 

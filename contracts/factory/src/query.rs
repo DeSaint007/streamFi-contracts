@@ -78,6 +78,41 @@ pub fn get_streams_by_creator_paginated(
     addrs
 }
 
+/// Pages over the whole stream registry in ID (creation) order (issue #959).
+///
+/// Returns up to `limit` stream addresses starting at registry position
+/// `offset`, with `limit` clamped to [`MAX_PAGE_SIZE`]. Walks the IDs in
+/// `offset..min(offset + limit, StreamCount)` and resolves each
+/// `StreamAddr(id)`; each hit has its persistent TTL renewed. An ID whose entry
+/// has expired is skipped, so a page can hold fewer addresses than the window
+/// it covered. Advance the cursor by the clamped `limit`, not by the length of
+/// the returned vector. An offset at or past the end yields an empty vector.
+///
+/// Arithmetic is done in `u64` with saturating adds, so `offset = u32::MAX`
+/// cannot overflow.
+pub fn get_streams_paged(env: &Env, offset: u32, limit: u32) -> Vec<Address> {
+    let mut out = Vec::new(env);
+    let total: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::StreamCount)
+        .unwrap_or(0);
+    let effective_limit = limit.min(MAX_PAGE_SIZE) as u64;
+    let start = offset as u64;
+    if start >= total || effective_limit == 0 {
+        return out;
+    }
+    let end = start.saturating_add(effective_limit).min(total);
+    for id in start..end {
+        let key = DataKey::StreamAddr(id);
+        if let Some(addr) = env.storage().persistent().get::<_, Address>(&key) {
+            crate::ttl::bump_persistent(env, &key);
+            out.push_back(addr);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

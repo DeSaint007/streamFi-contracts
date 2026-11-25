@@ -9,7 +9,7 @@ use soroban_sdk::{
     token, Address, Env, IntoVal, Symbol, TryFromVal, TryIntoVal, Vec,
 };
 
-use crate::{BatchTransferProcessorClient, Error};
+use crate::{BatchExecutionSummary, BatchTransferProcessorClient, Error};
 
 /// Mirrors `MAX_BATCH_SIZE` — the value `max_batch_size()` must expose and
 /// the cap `process_batch` enforces (reduced to 30 per issue #677).
@@ -218,7 +218,7 @@ fn max_batch_size_reports_the_enforced_cap() {
 fn version_reports_the_current_behaviour_version() {
     let s = Setup::new();
     // v4 adds the allowance-funded batch entry point.
-    assert_eq!(s.client.version(), 4);
+    assert_eq!(s.client.version(), 5);
 }
 
 #[test]
@@ -976,6 +976,83 @@ fn test_batch_withdraw_lenient_validation_guards() {
     );
 }
 
+// ── Issue #965: batch execution summary event ───────────────────────────────
+
+#[test]
+fn batch_withdraw_lenient_emits_execution_summary_with_failure_indices() {
+    let s = Setup::new();
+    let stream_success = s.env.register_contract(None, MockStreamContract);
+    let stream_fail = s.env.register_contract(None, MockStreamContract);
+
+    let mut stream_ids = Vec::new(&s.env);
+    stream_ids.push_back(stream_success);
+    stream_ids.push_back(stream_fail);
+
+    // Index 1 fails inside the mock (amount 999 -> NotAuthorized).
+    let amounts = s.amounts(&[100, 999]);
+    s.client.batch_withdraw_lenient(&stream_ids, &amounts);
+
+    // The summary is published last, after the per-batch lenient event.
+    let events = s.processor_events();
+    let (_, _, data) = events.last().unwrap();
+    let summary = BatchExecutionSummary::try_from_val(&s.env, data).unwrap();
+    assert_eq!(summary.total, 2);
+    assert_eq!(summary.successful, 1);
+    assert_eq!(summary.failed_indices.len(), 1);
+    assert_eq!(summary.failed_indices.get(0).unwrap(), 1);
+}
+
+// ── Issue #966: strict batch rollback with a mixed valid/invalid recipient set ──
+
+#[test]
+fn process_batch_rolls_back_entirely_when_one_recipient_is_invalid() {
+    let s = Setup::new();
+    let valid_a = Address::generate(&s.env);
+    let invalid = Address::generate(&s.env);
+    let valid_b = Address::generate(&s.env);
+
+    let mut recipients = Vec::new(&s.env);
+    recipients.push_back(valid_a.clone());
+    recipients.push_back(invalid.clone());
+    recipients.push_back(valid_b.clone());
+
+    // The middle recipient carries an invalid (zero) amount, so the batch
+    // must fail as a whole in strict mode.
+    let amounts = s.amounts(&[100, 0, 300]);
+
+    let funder_before = s.token.balance(&s.funder);
+    let contract_before = s.token.balance(&s.client.address);
+
+    assert_eq!(
+        s.client
+            .try_process_batch(&s.funder, &s.token_addr, &recipients, &amounts),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // No funds moved: funder untouched, no recipient paid, contract empty.
+    assert_eq!(s.token.balance(&s.funder), funder_before);
+    assert_eq!(s.token.balance(&valid_a), 0);
+    assert_eq!(s.token.balance(&invalid), 0);
+    assert_eq!(s.token.balance(&valid_b), 0);
+    assert_eq!(s.token.balance(&s.client.address), contract_before);
+
+    // No success event was published for the reverted batch.
+    assert!(s.processor_events().is_empty());
+
+    // The processor is still usable afterwards (no leftover reentrancy lock
+    // or partial state).
+    let mut ok_recipients = Vec::new(&s.env);
+    ok_recipients.push_back(valid_a.clone());
+    ok_recipients.push_back(valid_b.clone());
+    assert_eq!(
+        s.client
+            .process_batch(&s.funder, &s.token_addr, &ok_recipients, &s.amounts(&[100, 300])),
+        400
+    );
+    assert_eq!(s.token.balance(&valid_a), 100);
+    assert_eq!(s.token.balance(&valid_b), 300);
+}
+
 // ── Issue #762: TTL extension helpers ───────────────────────────────────────
 
 #[test]
@@ -1078,4 +1155,155 @@ fn test_fuzz_random_batch_amounts_boundary_100() {
         let cpu = s.env.budget().cpu_instruction_cost();
         assert!(cpu < 800_000, "fuzz batch {size} exceeded gas budget: {cpu}");
     }
+}
+
+// ── Issues #888 & #889: batch_top_up_lenient & adaptive TTL bumping ─────────
+
+#[soroban_sdk::contract]
+pub struct MockTopUpStreamContract;
+
+#[soroban_sdk::contractimpl]
+impl MockTopUpStreamContract {
+    pub fn set_config(env: Env, expiration_ledger: u32, fail_code: u32) {
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("exp"), &expiration_ledger);
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("fail"), &fail_code);
+    }
+
+    pub fn expiration_ledger(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("exp"))
+            .unwrap_or(0)
+    }
+
+    pub fn top_up(env: Env, _caller: Address, amount: i128) -> Result<(), Error> {
+        let fail_code: u32 = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("fail"))
+            .unwrap_or(0);
+        if fail_code != 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let prev: i128 = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("bal"))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("bal"), &(prev + amount));
+        Ok(())
+    }
+
+    pub fn topped_up_total(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("bal"))
+            .unwrap_or(0)
+    }
+}
+
+#[test]
+fn adaptive_ttl_uses_max_stream_expiration_and_clamps_bounds() {
+    let s = Setup::new();
+    let current = s.env.ledger().sequence();
+
+    // Register two mock streams: one short-lived, one long-lived (500_000 ledgers ahead).
+    let short_id = s.env.register_contract(None, MockTopUpStreamContract);
+    let long_id = s.env.register_contract(None, MockTopUpStreamContract);
+    MockTopUpStreamContractClient::new(&s.env, &short_id).set_config(&(current + 50_000), &0);
+    MockTopUpStreamContractClient::new(&s.env, &long_id).set_config(&(current + 500_000), &0);
+
+    let mut streams = Vec::new(&s.env);
+    streams.push_back(short_id);
+    streams.push_back(long_id);
+
+    let bump = s.client.bump_ttl_adaptive(&streams);
+    assert_eq!(bump, 500_000);
+
+    // Pure helper clamping check: past target falls back to default, huge target clamps to MAX_TTL_LEDGERS.
+    let mut past = Vec::new(&s.env);
+    past.push_back(current);
+    assert_eq!(
+        crate::ttl::compute_adaptive_bump_amount(current, &past),
+        drip_common::ttl::EXTEND_TTL_LEDGERS
+    );
+
+    let mut huge = Vec::new(&s.env);
+    huge.push_back(u32::MAX);
+    assert_eq!(
+        crate::ttl::compute_adaptive_bump_amount(0, &huge),
+        crate::ttl::MAX_TTL_LEDGERS
+    );
+}
+
+#[test]
+fn batch_top_up_lenient_isolates_failures_and_returns_per_item_status() {
+    let s = Setup::new();
+    let current = s.env.ledger().sequence();
+
+    let ok_stream_1 = s.env.register_contract(None, MockTopUpStreamContract);
+    let failing_stream = s.env.register_contract(None, MockTopUpStreamContract);
+    let ok_stream_2 = s.env.register_contract(None, MockTopUpStreamContract);
+
+    MockTopUpStreamContractClient::new(&s.env, &ok_stream_1).set_config(&(current + 300_000), &0);
+    MockTopUpStreamContractClient::new(&s.env, &failing_stream).set_config(&(current + 100_000), &1);
+    MockTopUpStreamContractClient::new(&s.env, &ok_stream_2).set_config(&(current + 250_000), &0);
+
+    let mut streams = Vec::new(&s.env);
+    streams.push_back(ok_stream_1.clone());
+    streams.push_back(failing_stream);
+    streams.push_back(ok_stream_2.clone());
+    streams.push_back(ok_stream_2.clone()); // 4th item has invalid amount (0)
+
+    let mut amounts = Vec::new(&s.env);
+    amounts.push_back(1_000);
+    amounts.push_back(2_000);
+    amounts.push_back(3_000);
+    amounts.push_back(0);
+
+    let results = s.client.batch_top_up_lenient(&s.funder, &streams, &amounts);
+    assert_eq!(results.len(), 4);
+
+    assert_eq!(
+        results.get(0).unwrap(),
+        crate::BatchResult {
+            item_index: 0,
+            success: true,
+            error_code: None,
+        }
+    );
+    assert!(!results.get(1).unwrap().success);
+    assert!(results.get(1).unwrap().error_code.is_some());
+    assert_eq!(
+        results.get(2).unwrap(),
+        crate::BatchResult {
+            item_index: 2,
+            success: true,
+            error_code: None,
+        }
+    );
+    assert_eq!(
+        results.get(3).unwrap(),
+        crate::BatchResult {
+            item_index: 3,
+            success: false,
+            error_code: Some(Error::InvalidAmount as u32),
+        }
+    );
+
+    // Valid streams received their top-ups despite failures in the same batch.
+    assert_eq!(
+        MockTopUpStreamContractClient::new(&s.env, &ok_stream_1).topped_up_total(),
+        1_000
+    );
+    assert_eq!(
+        MockTopUpStreamContractClient::new(&s.env, &ok_stream_2).topped_up_total(),
+        3_000
+    );
 }

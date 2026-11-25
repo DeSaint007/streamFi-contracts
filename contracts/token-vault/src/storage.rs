@@ -4,6 +4,8 @@ use soroban_sdk::{contracttype, Address, Env, Vec};
 #[derive(Clone)]
 pub enum DataKey {
     Owner,
+    /// Dedicated protocol emergency administrator (#948).
+    EmergencyAdmin,
     Token,
     MaxLimit,
     Balance,
@@ -21,8 +23,9 @@ pub enum DataKey {
     /// the operator is effectively unable to withdraw until the owner sets a
     /// positive cap.
     OperatorWithdrawLimit,
-    /// Emergency-pause flag. When `true`, all state-mutating entry points
-    /// (deposit, withdraw, set_limit) revert before touching state.
+    /// Emergency-pause flag. When `true`, all state-modifying entry points
+    /// revert with `VaultPaused` before touching state; `unpause` and TTL
+    /// keep-alive helpers remain callable.
     Paused,
     /// Pending owner address for the 2-step owner transfer.
     /// Set by `propose_owner`, consumed by `accept_owner`.
@@ -52,6 +55,10 @@ pub enum DataKey {
     DepositorTokens(Address, Address),
     /// Persistent storage: optional minimum deposit amount threshold per token (Issue #756).
     TokenMinDeposit(Address),
+    /// Governance-approved yield strategy vault that may receive swept tokens (Issue #893).
+    ApprovedStrategy(Address),
+    /// Running total of `token` swept into `strategy` (Issue #893).
+    StrategySwept(Address, Address),
 }
 
 #[contracttype]
@@ -75,6 +82,16 @@ pub fn set_owner(env: &Env, a: &Address) {
 
 pub fn get_owner(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::Owner)
+}
+
+pub fn set_emergency_admin(env: &Env, admin: &Address) {
+    env.storage()
+        .instance()
+        .set(&DataKey::EmergencyAdmin, admin);
+}
+
+pub fn get_emergency_admin(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::EmergencyAdmin)
 }
 
 pub fn set_token(env: &Env, t: &Address) {
@@ -210,6 +227,11 @@ pub fn get_token_account_balance(env: &Env, token: &Address, account: &Address) 
 
 pub fn set_token_account_balance(env: &Env, token: &Address, account: &Address, balance: i128) {
     let key = DataKey::TokenAccountBalance(token.clone(), account.clone());
+    if balance == 0 {
+        // Reclaim rent: reads of a missing entry already default to 0.
+        env.storage().persistent().remove(&key);
+        return;
+    }
     env.storage().persistent().set(&key, &balance);
     drip_common::ttl::bump_persistent(env, &key);
     track_vault_key(env, &key);
@@ -219,16 +241,18 @@ pub fn set_token_account_balance(env: &Env, token: &Address, account: &Address, 
 pub fn get_depositor_token_balance(env: &Env, depositor: &Address, token: &Address) -> i128 {
     env.storage()
         .persistent()
-        .get(&DataKey::DepositorTokens(
-            depositor.clone(),
-            token.clone(),
-        ))
+        .get(&DataKey::DepositorTokens(depositor.clone(), token.clone()))
         .unwrap_or(0)
 }
 
 /// Sets balance of a specific token deposited by a user (Issue #757).
 pub fn set_depositor_token_balance(env: &Env, depositor: &Address, token: &Address, balance: i128) {
     let key = DataKey::DepositorTokens(depositor.clone(), token.clone());
+    if balance == 0 {
+        // Reclaim rent: reads of a missing entry already default to 0.
+        env.storage().persistent().remove(&key);
+        return;
+    }
     env.storage().persistent().set(&key, &balance);
     drip_common::ttl::bump_persistent(env, &key);
 }
@@ -275,6 +299,28 @@ pub fn remove_emergency_migration(env: &Env) {
     env.storage()
         .instance()
         .remove(&DataKey::EmergencyMigration);
+}
+
+/// Returns `true` while the transient reentrancy guard is held.
+pub fn is_reentrancy_locked(env: &Env) -> bool {
+    env.storage()
+        .temporary()
+        .get::<_, bool>(&DataKey::ReentrancyLock)
+        .unwrap_or(false)
+}
+
+/// Acquires the transient reentrancy guard in temporary storage.
+pub fn set_reentrancy_lock(env: &Env) {
+    env.storage()
+        .temporary()
+        .set(&DataKey::ReentrancyLock, &true);
+}
+
+/// Releases the transient reentrancy guard from temporary storage.
+pub fn remove_reentrancy_lock(env: &Env) {
+    env.storage()
+        .temporary()
+        .remove(&DataKey::ReentrancyLock);
 }
 
 /// Explicit owner approval is required before accepting a multi-token deposit.
@@ -335,4 +381,44 @@ pub fn tracked_vault_keys(env: &Env) -> Vec<DataKey> {
         .instance()
         .get(&DataKey::TrackedVaultKeys)
         .unwrap_or(Vec::new(env))
+}
+
+/// Sum tracked account liabilities for one token (#948).
+pub fn tracked_liability_for_token(env: &Env, token: &Address) -> i128 {
+    let mut total = 0_i128;
+    for key in tracked_vault_keys(env).iter() {
+        if let DataKey::TokenAccountBalance(key_token, account) = key {
+            if key_token == *token {
+                total = total.saturating_add(get_token_account_balance(env, &key_token, &account));
+            }
+        }
+    }
+    total
+}
+
+pub fn is_strategy_approved(env: &Env, strategy: &Address) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::ApprovedStrategy(strategy.clone()))
+        .unwrap_or(false)
+}
+
+pub fn set_strategy_approved(env: &Env, strategy: &Address, approved: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ApprovedStrategy(strategy.clone()), &approved);
+}
+
+pub fn get_strategy_swept(env: &Env, token: &Address, strategy: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::StrategySwept(token.clone(), strategy.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_strategy_swept(env: &Env, token: &Address, strategy: &Address, total: i128) {
+    env.storage().instance().set(
+        &DataKey::StrategySwept(token.clone(), strategy.clone()),
+        &total,
+    );
 }

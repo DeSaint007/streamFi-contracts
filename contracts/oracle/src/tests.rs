@@ -303,6 +303,107 @@ fn submit_observation_rejects_far_future_timestamp() {
     assert_eq!(res, Err(Ok(Error::TimestampInvalid)));
 }
 
+// ─── TWAP edge cases ────────────────────────────────────────────────────────
+
+#[test]
+fn get_twap_handles_flatline_price_feed() {
+    let env = base_env();
+    let admin = Address::generate(&env);
+    let client = deploy(&env, &admin);
+    let asset = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    configure(&admin, &client, &asset, 600, 600);
+    client.add_oracle(&admin, &asset, &oracle);
+
+    let start = env.ledger().timestamp();
+    let flat_price = 1_000_000i128;
+
+    // Submit multiple observations with the same price at different times
+    for i in 0..5 {
+        let ts = start + (i * 60) as u64;
+        client.submit_observation(&oracle, &asset, &flat_price, &ts);
+        advance(&env, 60);
+    }
+
+    // TWAP of a flat price should equal that price
+    let (price, _) = client.try_get_twap(&asset).unwrap().unwrap();
+    assert_eq!(price, flat_price, "TWAP of flat price feed should equal the price");
+}
+
+#[test]
+fn get_twap_with_sparse_irregular_intervals() {
+    let env = base_env();
+    let admin = Address::generate(&env);
+    let client = deploy(&env, &admin);
+    let asset = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    configure(&admin, &client, &asset, 1000, 1000);
+    client.add_oracle(&admin, &asset, &oracle);
+
+    let start = env.ledger().timestamp();
+
+    // Submit observations at irregular intervals
+    client.submit_observation(&oracle, &asset, &100i128, &start);
+    advance(&env, 10);
+
+    client.submit_observation(&oracle, &asset, &150i128, &(start + 10));
+    advance(&env, 50);
+
+    client.submit_observation(&oracle, &asset, &200i128, &(start + 60));
+    advance(&env, 5);
+
+    // Should compute TWAP without error despite irregular intervals
+    let (price, _) = client.try_get_twap(&asset).unwrap().unwrap();
+    assert!(price > 0, "TWAP with sparse intervals should compute successfully");
+}
+
+#[test]
+fn get_twap_with_zero_price_change_across_intervals() {
+    let env = base_env();
+    let admin = Address::generate(&env);
+    let client = deploy(&env, &admin);
+    let asset = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    configure(&admin, &client, &asset, 500, 500);
+    client.add_oracle(&admin, &asset, &oracle);
+
+    let start = env.ledger().timestamp();
+
+    // Price stays at 500, then changes to 1000, then back to 500
+    client.submit_observation(&oracle, &asset, &500i128, &start);
+    advance(&env, 100);
+
+    client.submit_observation(&oracle, &asset, &1000i128, &(start + 100));
+    advance(&env, 100);
+
+    client.submit_observation(&oracle, &asset, &500i128, &(start + 200));
+    advance(&env, 50);
+
+    // Expected: 500*100 + 1000*100 + 500*0 = 150000, weight = 200, TWAP = 750
+    let (price, _) = client.try_get_twap(&asset).unwrap().unwrap();
+    assert_eq!(price, 750, "TWAP should correctly handle price oscillation");
+}
+
+#[test]
+fn get_twap_minimum_viable_feed_single_point() {
+    let env = base_env();
+    let admin = Address::generate(&env);
+    let client = deploy(&env, &admin);
+    let asset = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    configure(&admin, &client, &asset, 600, 600);
+    client.add_oracle(&admin, &asset, &oracle);
+
+    let now = env.ledger().timestamp();
+    let price = 42_000_000i128;
+    client.submit_observation(&oracle, &asset, &price, &now);
+
+    // Single point TWAP should return the price itself
+    let (result_price, decimals) = client.try_get_twap(&asset).unwrap().unwrap();
+    assert_eq!(result_price, price);
+    assert_eq!(decimals, 7);
+}
+
 // ─── buffer rollover + get_twap ─────────────────────────────────────
 
 #[test]

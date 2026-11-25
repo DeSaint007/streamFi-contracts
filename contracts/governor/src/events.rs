@@ -208,6 +208,26 @@ pub fn proposal_cancelled_by_admin(
     );
 }
 
+/// Emitted when the timelock delay is changed (Issue #967).
+pub fn set_timelock_delay(env: &Env, caller: &Address, old_seconds: u64, new_seconds: u64) {
+    env.events().publish(
+        (symbol_short!("tlock"), caller.clone()),
+        (old_seconds, new_seconds),
+    );
+}
+
+/// Emitted when a `SecurityGuardian` emergency-cancels a queued proposal (Issue #968).
+pub fn proposal_emergency_cancelled(env: &Env, guardian: &Address, proposal_id: u64) {
+    env.events().publish(
+        (
+            Symbol::new(env, "EmergencyCancelled"),
+            guardian.clone(),
+            proposal_id,
+        ),
+        (),
+    );
+}
+
 pub fn set_min_quorum_bps(
     env: &Env,
     caller: &Address,
@@ -239,5 +259,20 @@ pub fn proposal_execution_queued(env: &Env, proposal_id: u64, execution_time: u6
     env.events().publish(
         (Symbol::new(env, "exec_queue"), proposal_id),
         execution_time,
+    );
+}
+
+/// Emitted when a proposal is vetoed by security guardian or emergency multisig (Issue #909).
+/// Publishes the guardian address, proposal ID, and justification hash for community transparency.
+pub fn proposal_vetoed(
+    env: &Env,
+    proposal_id: u64,
+    guardian: &Address,
+    justification_hash: &String,
+    timestamp: u64,
+) {
+    env.events().publish(
+        (Symbol::new(env, "proposal_vetoed"), proposal_id),
+        (guardian.clone(), justification_hash.clone(), timestamp),
     );
 }

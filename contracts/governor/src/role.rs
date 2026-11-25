@@ -45,6 +45,14 @@ pub fn has_role(env: &Env, role: Role, account: &Address) -> bool {
     rbac::has_role(env, &role_key(role, account))
 }
 
+/// Number of accounts currently holding `Role::SuperAdmin` (zero pre-initialization).
+///
+/// Part of the governor RBAC surface; tracks the highest tier of administration.
+#[allow(dead_code)]
+pub fn super_admin_count(env: &Env) -> u32 {
+    rbac::admin_count(env, &DataKey::SuperAdminCount)
+}
+
 /// Number of accounts currently holding `Role::Admin` (zero pre-initialization).
 ///
 /// Part of the governor RBAC surface; no contract entry point calls it yet.
@@ -60,12 +68,18 @@ pub fn grant_with_expiration(
     account: &Address,
     expires_at: Option<u64>,
 ) -> bool {
+    let count_key = match role {
+        Role::SuperAdmin => &DataKey::SuperAdminCount,
+        Role::Admin => &DataKey::AdminCount,
+        _ => &DataKey::AdminCount,
+    };
+
     rbac::grant_with_expiration(
         env,
         &role_key(role, account),
-        &DataKey::AdminCount,
+        count_key,
         &members_key(role),
-        role == Role::Admin,
+        role == Role::SuperAdmin || role == Role::Admin,
         account,
         expires_at,
     )
@@ -77,29 +91,77 @@ pub fn grant_with_expiration(
 /// admin count can never be inflated by repeated grants. Returns `true` if the
 /// role was newly granted, or `false` if the account already held it.
 pub fn grant(env: &Env, role: Role, account: &Address) -> bool {
+    let count_key = match role {
+        Role::SuperAdmin => &DataKey::SuperAdminCount,
+        Role::Admin => &DataKey::AdminCount,
+        _ => &DataKey::AdminCount,
+    };
+
     rbac::grant(
         env,
         &role_key(role, account),
-        &DataKey::AdminCount,
+        count_key,
         &members_key(role),
-        role == Role::Admin,
+        role == Role::SuperAdmin || role == Role::Admin,
         account,
     )
 }
 
+/// Requires that the caller has sufficient privilege to revoke a target role (Issue #907).
+///
+/// Enforces role hierarchy to prevent governance capture:
+/// - Only `SuperAdmin` can revoke `SuperAdmin` or `Admin` roles
+/// - `Admin` can revoke lower roles (`FeeManager`, `RateManager`, `Pauser`, `Executor`) only
+/// - Lower roles cannot revoke any role
+pub fn require_revoke_privilege(
+    env: &Env,
+    caller: &Address,
+    target_role: Role,
+) -> Result<(), Error> {
+    let caller_is_super_admin = has_role(env, Role::SuperAdmin, caller);
+    let caller_is_admin = has_role(env, Role::Admin, caller);
+
+    match target_role {
+        Role::SuperAdmin | Role::Admin => {
+            if caller_is_super_admin {
+                Ok(())
+            } else {
+                Err(Error::NotAuthorized)
+            }
+        }
+        _ => {
+            if caller_is_super_admin || caller_is_admin {
+                Ok(())
+            } else {
+                Err(Error::NotAuthorized)
+            }
+        }
+    }
+}
+
 /// Revokes `role` from `account`.
 ///
-/// Idempotent when the account doesn't hold the role. Refuses to remove the
-/// final `Admin` (`LastAdmin`): a governor with zero admins could never grant
-/// a new one, permanently freezing every protocol parameter. Returns `true` if
-/// the role was newly revoked, or `false` if the account did not hold it.
+/// Idempotent when the account doesn't hold the role. Enforces role hierarchy
+/// to prevent governance capture via compromised sub-admin keys:
+/// - Only `SuperAdmin` can revoke `SuperAdmin` or `Admin` roles
+/// - `Admin` can revoke lower roles only
+/// - Refuses to remove the final `SuperAdmin` or `Admin` (`LastAdmin`):
+///   a governor with zero admins could never grant a new one, permanently
+///   freezing every protocol parameter. Returns `true` if the role was newly
+///   revoked, or `false` if the account did not hold it.
 pub fn revoke(env: &Env, role: Role, account: &Address) -> Result<bool, Error> {
+    let count_key = match role {
+        Role::SuperAdmin => &DataKey::SuperAdminCount,
+        Role::Admin => &DataKey::AdminCount,
+        _ => &DataKey::AdminCount,
+    };
+
     rbac::revoke(
         env,
         &role_key(role, account),
-        &DataKey::AdminCount,
+        count_key,
         &members_key(role),
-        role == Role::Admin,
+        role == Role::SuperAdmin || role == Role::Admin,
         account,
     )
     .map_err(|e| match e {
@@ -164,10 +226,77 @@ pub fn require_role_or_admin(env: &Env, caller: &Address, role: Role) -> Result<
 /// Require that `caller` authorized the transaction and holds `Pauser` **or** `Admin` role.
 /// Emergency responders (pausers) can execute pause/unpause operations (Issue #771).
 /// This separates regular parameter tuning from emergency pause authority.
+/// #1013: Supports optional m-of-n guardian multi-signature for emergency actions.
 ///
 /// Bumps instance TTL on success.
 pub fn require_emergency_responder(env: &Env, caller: &Address) -> Result<(), Error> {
-    require_role_or_admin(env, caller, Role::Pauser)
+    // Direct role check first
+    if has_role(env, Role::Pauser, caller) || has_role(env, Role::Admin, caller) {
+        ttl::bump(env);
+        return Ok(());
+    }
+    // #1013: Check if multi-sig threshold is configured
+    if let Some(threshold) = env.storage().instance().get(&DataKey::EmergencyMultisigThreshold) {
+        if threshold > 0 {
+            let signed: u32 = env.storage().temporary().get(&DataKey::EmergencySignatures).unwrap_or(0);
+            if signed >= threshold {
+                ttl::bump(env);
+                return Ok(());
+            }
+        }
+    }
+    Err(Error::NotAuthorized)
+}
+
+/// #1013: Set the m-of-n threshold for emergency action execution.
+pub fn set_emergency_multisig_threshold(env: &Env, threshold: u32) -> Result<(), Error> {
+    let guardians = rbac::admin_count(env, &DataKey::AdminCount);
+    if threshold == 0 || threshold > guardians {
+        return Err(Error::InvalidParam);
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::EmergencyMultisigThreshold, &threshold);
+    Ok(())
+}
+
+/// Require M-of-N approval for a critical parameter update (#970).
+///
+/// Succeeds only when at least `threshold` distinct accounts in `approvers`
+/// hold `Role::Admin` and have authorized this invocation. Duplicate entries
+/// count once, and non-admins are ignored. Fails with `InvalidParam` when
+/// `threshold` is zero or larger than the number of approvers, and with
+/// `NotAuthorized` when too few valid approvals are present.
+///
+/// This is the verification helper. Callers that need multi-sig must pass the
+/// approver list and threshold themselves.
+pub fn require_admin_threshold(
+    env: &Env,
+    approvers: &Vec<Address>,
+    threshold: u32,
+) -> Result<(), Error> {
+    if threshold == 0 || approvers.len() < threshold {
+        return Err(Error::InvalidParam);
+    }
+    let mut counted: Vec<Address> = Vec::new(env);
+    for approver in approvers.iter() {
+        let mut already = false;
+        for seen in counted.iter() {
+            if seen == approver {
+                already = true;
+                break;
+            }
+        }
+        if already || !has_role(env, Role::Admin, &approver) {
+            continue;
+        }
+        approver.require_auth();
+        counted.push_back(approver);
+        if counted.len() >= threshold {
+            return Ok(());
+        }
+    }
+    Err(Error::NotAuthorized)
 }
 
 /// Propose transferring the admin role to a new address (step 1 of 2) (Issue #682).

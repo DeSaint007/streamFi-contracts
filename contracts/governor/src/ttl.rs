@@ -22,3 +22,17 @@ pub fn extend_for_proposal(env: &soroban_sdk::Env, timelock_secs: u64, execution
     let total_lifetime = timelock_secs.saturating_add(execution_window_secs);
     drip_common::ttl::extend_instance(env, total_lifetime);
 }
+
+/// #1015: Bump persistent storage TTL when a vote is cast on a proposal.
+/// Ensures the proposal record survives through the execution window
+/// even for proposals with long voting + timelock durations.
+pub fn bump_on_vote(env: &soroban_sdk::Env, timelock_secs: u64, execution_window_secs: u64) {
+    extend_for_proposal(env, timelock_secs, execution_window_secs);
+}
+
+/// #1015: Bump persistent storage TTL when a proposal is executed.
+/// Ensures the proposal record and all related state remain retrievable
+/// through final archiving.
+pub fn bump_on_execute(env: &soroban_sdk::Env, timelock_secs: u64, execution_window_secs: u64) {
+    extend_for_proposal(env, timelock_secs, execution_window_secs);
+}

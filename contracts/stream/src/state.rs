@@ -1,8 +1,8 @@
-use soroban_sdk::{panic_with_error, Env};
+use soroban_sdk::{contracttype, panic_with_error, Env};
 
+use crate::storage::{DataKey, MutableStreamState, StreamInfo, StreamMetadata};
 #[allow(unused_imports)]
 pub use crate::storage::StreamState;
-use crate::storage::{DataKey, MutableStreamState, StreamInfo, StreamMetadata};
 use crate::Error;
 
 /// Calculate stream age in seconds from start_time up to current_time (Issue #808).
@@ -29,11 +29,10 @@ pub fn is_fully_vested(info: &StreamInfo, current_time: u64) -> bool {
 /// the consolidated layout; pre-consolidation streams were migrated on their
 /// first `save()` call (see `save()` for the one-time migration logic).
 pub fn try_load(env: &Env) -> Result<StreamInfo, Error> {
-    let storage = env.storage().instance();
-
+    let s = env.storage().instance();
     if let (Some(metadata), Some(state)) = (
-        storage.get::<_, StreamMetadata>(&DataKey::Metadata),
-        storage.get::<_, MutableStreamState>(&DataKey::State),
+        s.get::<_, StreamMetadata>(&DataKey::Metadata),
+        s.get::<_, MutableStreamState>(&DataKey::State),
     ) {
         return Ok(StreamInfo {
             sender: metadata.sender,
@@ -49,10 +48,7 @@ pub fn try_load(env: &Env) -> Result<StreamInfo, Error> {
             cumulative_fees: state.cumulative_fees,
         });
     }
-
-    // Backward-compatible read for streams persisted before #942.
-    storage
-        .get::<_, StreamInfo>(&DataKey::Config)
+    s.get::<_, StreamInfo>(&DataKey::Config)
         .ok_or(Error::NotInitialized)
 }
 
@@ -69,10 +65,9 @@ pub fn load(env: &Env) -> StreamInfo {
 /// Pre-consolidation streams were migrated on their first `save()` call
 /// in a prior contract version (legacy keys were removed as part of the upgrade).
 pub fn save(env: &Env, info: &StreamInfo) {
-    let storage = env.storage().instance();
-
-    if !storage.has(&DataKey::Metadata) {
-        storage.set(
+    let s = env.storage().instance();
+    if !s.has(&DataKey::Metadata) {
+        s.set(
             &DataKey::Metadata,
             &StreamMetadata {
                 sender: info.sender.clone(),
@@ -81,8 +76,7 @@ pub fn save(env: &Env, info: &StreamInfo) {
             },
         );
     }
-
-    storage.set(
+    s.set(
         &DataKey::State,
         &MutableStreamState {
             recipient: info.recipient.clone(),
@@ -95,10 +89,8 @@ pub fn save(env: &Env, info: &StreamInfo) {
             cumulative_fees: info.cumulative_fees,
         },
     );
-
-    // Migrate legacy consolidated state after the split representation exists.
-    if storage.has(&DataKey::Config) {
-        storage.remove(&DataKey::Config);
+    if s.has(&DataKey::Config) {
+        s.remove(&DataKey::Config);
     }
 }
 
@@ -108,6 +100,91 @@ pub fn assert_not_cancelled(info: &StreamInfo) -> Result<(), Error> {
     } else {
         Ok(())
     }
+}
+
+/// Check if a stream is in a cancellable state (Issue #937).
+///
+/// Returns `true` if the stream can be cancelled:
+/// - Stream is not already cancelled
+/// - Stream has not been fully completed/withdrawn
+///
+/// The caller authorization (sender permissions, recipient restrictions) should be
+/// validated separately at the contract method level using stream config and address.
+pub fn is_cancellable(info: &StreamInfo) -> Result<bool, Error> {
+    // Stream cannot be cancelled if it's already in a terminal cancelled state
+    if info.is_cancelled() {
+        return Ok(false);
+    }
+
+    // Stream can be cancelled as long as it's not fully cancelled
+    // Other authorization checks (sender, recipient, etc.) are done at the method level
+    Ok(info.is_in_cancellable_state())
+}
+
+/// Validate stream state transition from Paused to Cancelled.
+///
+/// Ensures that when a paused stream transitions to cancelled, the state remains consistent
+/// and unvested remainder refund calculations are correct. This validates:
+/// - Stream is currently paused
+/// - Stream is not already cancelled
+/// - Refund calculations will not overflow
+/// - Cancelled state can be safely persisted
+///
+/// # Arguments
+/// - `info` — The current stream state
+/// - `current_time` — Current timestamp for calculating streamed amount
+/// - `balance` — Current contract balance for the stream token
+///
+/// # Returns
+/// - `Ok(())` if the transition is valid
+/// - `Err(Error::NotPaused)` if the stream is not paused
+/// - `Err(Error::StreamCancelled)` if the stream is already cancelled
+/// - `Err(Error::ArithmeticOverflow)` if refund calculation overflows
+pub fn validate_paused_to_cancelled_transition(
+    info: &StreamInfo,
+    current_time: u64,
+    balance: i128,
+) -> Result<(), Error> {
+    // Stream must be in paused state to transition to cancelled
+    if !info.is_paused() {
+        return Err(Error::NotPaused);
+    }
+
+    // Stream must not already be cancelled
+    if info.is_cancelled() {
+        return Err(Error::StreamCancelled);
+    }
+
+    // Verify refund calculation will not overflow.
+    // During cancellation:
+    // 1. Calculate streamed amount (what has been earned)
+    // 2. Calculate owed_to_recipient = max(0, streamed - withdrawn)
+    // 3. Calculate refund_to_sender = max(0, balance - owed_to_recipient)
+    // 4. Calculate total_withdrawn = withdrawn + owed_to_recipient (this must not overflow)
+
+    let streamed = if info.rate_per_second > 0 && info.end_time > current_time {
+        let elapsed = current_time.saturating_sub(info.start_time);
+        (info.rate_per_second as u128)
+            .saturating_mul(elapsed as u128)
+            .min(i128::MAX as u128) as i128
+    } else if info.end_time > 0 && current_time >= info.end_time {
+        // Stream has ended or is fully vested
+        let total_duration = info.end_time.saturating_sub(info.start_time);
+        (info.rate_per_second as u128)
+            .saturating_mul(total_duration as u128)
+            .min(i128::MAX as u128) as i128
+    } else {
+        0
+    };
+
+    let owed_to_recipient = (streamed - info.withdrawn).max(0).min(balance);
+
+    // Verify total_withdrawn calculation won't overflow
+    info.withdrawn
+        .checked_add(owed_to_recipient)
+        .ok_or(Error::ArithmeticOverflow)?;
+
+    Ok(())
 }
 
 /// Maximum allowed re-entrancy depth. Must never be > 1 in production —
@@ -174,4 +251,108 @@ pub fn with_guard<R>(env: &Env, f: impl FnOnce(&Env) -> Result<R, Error>) -> Res
     let result = f(env);
     unlock(env);
     result
+}
+
+/// Vesting trajectory topology for a stream (#883).
+#[contracttype]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum VestingCurve {
+    /// Uniform linear vesting over the stream duration.
+    #[default]
+    Linear,
+    /// Front-loaded concave decay curve parameterized by basis-points decay coefficient (`decay_bps`).
+    /// `0` reduces to linear vesting; larger values accelerate early vesting.
+    ExponentialDecay(u32),
+    /// Discrete step vesting unlocking in equal steps every `step_duration` seconds.
+    Stepped(u64),
+}
+
+pub fn set_vesting_curve(env: &Env, curve: &VestingCurve) {
+    env.storage().instance().set(&DataKey::VestingCurve, curve);
+}
+
+pub fn get_vesting_curve(env: &Env) -> VestingCurve {
+    env.storage()
+        .instance()
+        .get(&DataKey::VestingCurve)
+        .unwrap_or_default()
+}
+
+/// Overflow-safe `(a * b) / denom` for `u128` without intermediate overflow.
+fn mul_div_u128(a: u128, b: u128, denom: u128) -> u128 {
+    if denom == 0 || a == 0 || b == 0 {
+        return 0;
+    }
+    if let Some(prod) = a.checked_mul(b) {
+        return prod / denom;
+    }
+    let q = a / denom;
+    let r = a % denom;
+    let part1 = q.saturating_mul(b);
+    let part2 = r.checked_mul(b).map(|p| p / denom).unwrap_or_else(|| {
+        let q2 = b / denom;
+        let r2 = b % denom;
+        r.saturating_mul(q2)
+            .saturating_add(r.saturating_mul(r2) / denom)
+    });
+    part1.saturating_add(part2)
+}
+
+/// Computes vested amount for a stream under the given [`VestingCurve`] (#883).
+///
+/// Guarantees `0 <= vested <= total_amount`, monotonicity in `elapsed`, and
+/// overflow-free execution across extreme durations (`1` second up to `u64::MAX`).
+pub fn vested_amount_for_curve(
+    curve: &VestingCurve,
+    total_amount: i128,
+    elapsed: u64,
+    duration: u64,
+) -> Result<i128, Error> {
+    if total_amount < 0 {
+        return Err(Error::InvalidAmount);
+    }
+    if total_amount == 0 || elapsed == 0 {
+        return Ok(0);
+    }
+    if duration == 0 || elapsed >= duration {
+        return Ok(total_amount);
+    }
+
+    let total = total_amount as u128;
+    let el = elapsed as u128;
+    let dur = duration as u128;
+
+    let vested = match *curve {
+        VestingCurve::Linear => mul_div_u128(total, el, dur),
+        VestingCurve::Stepped(step_duration) => {
+            if step_duration == 0 {
+                mul_div_u128(total, el, dur)
+            } else {
+                let total_steps = duration / step_duration;
+                if total_steps == 0 {
+                    0
+                } else {
+                    let completed_steps = (elapsed / step_duration).min(total_steps);
+                    mul_div_u128(total, completed_steps as u128, total_steps as u128)
+                }
+            }
+        }
+        VestingCurve::ExponentialDecay(decay_bps) => {
+            if decay_bps == 0 {
+                mul_div_u128(total, el, dur)
+            } else {
+                const SCALE: u128 = 1_000_000;
+                let x_ppm = mul_div_u128(el, SCALE, dur);
+                let k = (decay_bps as u128).min(100_000) * 100;
+                let num = (SCALE + k).saturating_mul(x_ppm);
+                let den = SCALE
+                    .saturating_mul(SCALE)
+                    .saturating_add(k.saturating_mul(x_ppm));
+                let ratio_ppm = mul_div_u128(num, SCALE, den).min(SCALE);
+                mul_div_u128(total, ratio_ppm, SCALE)
+            }
+        }
+    };
+
+    Ok(vested.min(total) as i128)
 }

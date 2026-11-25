@@ -3,9 +3,33 @@ use soroban_sdk::{Env, U256};
 use crate::errors::Error;
 use crate::storage::{CliffConfig, DataKey, RateCheckpoint, StreamInfo};
 
+/// Safely calculates `amount * numerator / denominator` with checked arithmetic
+/// to prevent overflow (Issue #939). Handles i128 inputs and results with proper
+/// error handling for arithmetic errors.
+pub fn safe_mul_div(amount: i128, numerator: i128, denominator: i128) -> Result<i128, Error> {
+    if denominator == 0 {
+        return Err(Error::ArithmeticOverflow);
+    }
+    if amount == 0 || numerator == 0 {
+        return Ok(0);
+    }
+    // Use checked_mul and checked_div to detect overflow
+    let intermediate = amount
+        .checked_mul(numerator)
+        .ok_or(Error::ArithmeticOverflow)?;
+    intermediate
+        .checked_div(denominator)
+        .ok_or(Error::ArithmeticOverflow)
+}
+
 /// Calculates `value * multiplier / divisor` without overflowing an i128
 /// intermediate. Inputs and the result are non-negative.
-pub fn mul_div(env: &Env, value: i128, multiplier: u128, divisor: u128) -> Result<i128, Error> {
+pub fn mul_div(
+    env: &Env,
+    value: i128,
+    multiplier: u128,
+    divisor: u128,
+) -> Result<i128, Error> {
     if value < 0 || divisor == 0 {
         return Err(Error::ArithmeticOverflow);
     }
@@ -192,6 +216,57 @@ pub fn withdrawable(env: &Env, info: &StreamInfo) -> Result<i128, Error> {
     Ok(available.max(0))
 }
 
+/// Calculates stepped vesting amount for monthly or other periodic milestone unlocks (Issue #940).
+///
+/// Tokens unlock in discrete steps at regular intervals rather than continuously.
+/// Each completed step unlocks an equal portion of the total amount.
+///
+/// # Arguments
+/// - `elapsed`: time elapsed since vesting start in seconds
+/// - `total_duration`: total vesting duration in seconds
+/// - `step_duration`: duration of each vesting step in seconds (e.g., 2_592_000 for ~30 days)
+/// - `total_amount`: total tokens to vest
+///
+/// # Returns
+/// Amount unlocked at the current milestone step, or error on overflow.
+///
+/// # Examples
+/// - 10,000 tokens vesting over 100 days with 10-day steps: each 10-day milestone unlocks 1,000 tokens.
+/// - At elapsed=15 days (1.5 steps), returns amount for 1 complete step: 1,000 tokens.
+#[allow(dead_code)]
+pub fn calculate_stepped_vesting(
+    elapsed: u64,
+    total_duration: u64,
+    step_duration: u64,
+    total_amount: i128,
+) -> Result<i128, Error> {
+    if step_duration == 0 || total_duration == 0 {
+        return Err(Error::InvalidTimeRange);
+    }
+    if total_amount < 0 {
+        return Err(Error::InvalidAmount);
+    }
+    if elapsed == 0 || total_amount == 0 {
+        return Ok(0);
+    }
+
+    // Calculate the number of completed steps
+    let completed_steps = elapsed / step_duration;
+    let total_steps = (total_duration + step_duration - 1) / step_duration; // Ceiling division
+
+    if completed_steps >= total_steps {
+        return Ok(total_amount);
+    }
+
+    // Amount per step = total_amount / total_steps
+    let amount_per_step = safe_mul_div(total_amount, 1, total_steps as i128)?;
+
+    // Total vested = amount_per_step * completed_steps
+    amount_per_step
+        .checked_mul(completed_steps as i128)
+        .ok_or(Error::ArithmeticOverflow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,10 +383,7 @@ mod tests {
 
         // Test half of max
         let half_max = i128::MAX / 2;
-        assert_eq!(
-            rate_duration_saturating(half_max, 2),
-            half_max.saturating_mul(2)
-        );
+        assert_eq!(rate_duration_saturating(half_max, 2), half_max.saturating_mul(2));
         // With 3, it would overflow to max
         assert_eq!(rate_duration_saturating(half_max, 3), i128::MAX);
     }
@@ -420,21 +492,131 @@ mod tests {
         let max_streamed = calculate_decay_stream(initial, u64::MAX, half_life).unwrap();
         assert_eq!(max_streamed, initial);
     }
+}
+
+/// Rounding direction for [`interpolate_vested`] (#879).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundingMode {
+    RoundUp,
+    RoundDown,
+}
+
+/// Linear vesting `total * elapsed / duration` with an explicit rounding
+/// mode, overflow free for any `i128` total and `u64` times (#879).
+///
+/// `elapsed` is clamped to `duration`, so at or after completion the result
+/// is exactly `total`, never more, and no rounding dust is left behind. A
+/// zero `duration` counts as fully vested; a non-positive `total` vests
+/// nothing.
+#[allow(dead_code)]
+pub fn interpolate_vested(
+    elapsed: u64,
+    duration: u64,
+    total: i128,
+    rounding: RoundingMode,
+) -> i128 {
+    if total <= 0 {
+        return 0;
+    }
+    if duration == 0 || elapsed >= duration {
+        return total;
+    }
+
+    let (total, elapsed, duration) = (total as u128, elapsed as u128, duration as u128);
+    // Split total = q * duration + r so neither product can overflow:
+    // q * elapsed <= total, and r * elapsed < duration^2 < 2^128.
+    let (q, r) = (total / duration, total % duration);
+    let partial = r * elapsed;
+    let mut vested = q * elapsed + partial / duration;
+    if rounding == RoundingMode::RoundUp && partial % duration != 0 {
+        vested += 1;
+    }
+    vested as i128
+}
+
+#[cfg(test)]
+mod interpolate_tests {
+    use super::*;
+
+    #[test]
+    fn exact_division_is_the_same_in_both_modes() {
+        for mode in [RoundingMode::RoundDown, RoundingMode::RoundUp] {
+            assert_eq!(interpolate_vested(25, 100, 1_000, mode), 250);
+        }
+    }
+
+    #[test]
+    fn modes_differ_by_one_on_a_fraction() {
+        // 10 * 1 / 3 = 3.33...
+        assert_eq!(interpolate_vested(1, 3, 10, RoundingMode::RoundDown), 3);
+        assert_eq!(interpolate_vested(1, 3, 10, RoundingMode::RoundUp), 4);
+    }
+
+    #[test]
+    fn completion_returns_exactly_the_total() {
+        for mode in [RoundingMode::RoundDown, RoundingMode::RoundUp] {
+            assert_eq!(interpolate_vested(7, 7, 10, mode), 10);
+            assert_eq!(interpolate_vested(u64::MAX, 7, 10, mode), 10);
+        }
+    }
+
+    #[test]
+    fn edge_inputs() {
+        assert_eq!(interpolate_vested(5, 0, 10, RoundingMode::RoundDown), 10);
+        assert_eq!(interpolate_vested(0, 100, 10, RoundingMode::RoundUp), 0);
+        assert_eq!(interpolate_vested(50, 100, 0, RoundingMode::RoundUp), 0);
+        assert_eq!(interpolate_vested(50, 100, -10, RoundingMode::RoundUp), 0);
+    }
+
+    #[test]
+    fn does_not_overflow_at_the_extremes() {
+        let half = u64::MAX / 2;
+        let down = interpolate_vested(half, u64::MAX, i128::MAX, RoundingMode::RoundDown);
+        let up = interpolate_vested(half, u64::MAX, i128::MAX, RoundingMode::RoundUp);
+        assert!(down > 0 && down <= i128::MAX / 2);
+        assert!(up == down || up == down + 1);
+        let near_end = interpolate_vested(u64::MAX - 1, u64::MAX, i128::MAX, RoundingMode::RoundUp);
+        assert!(near_end < i128::MAX);
+        assert_eq!(
+            interpolate_vested(u64::MAX, u64::MAX, i128::MAX, RoundingMode::RoundUp),
+            i128::MAX
+        );
+    }
+
+    #[test]
+    fn micro_schedule_withdrawals_sum_to_the_principal() {
+        // 7 units over 3 seconds, claimed every second: increments of the
+        // vested curve add back to the full deposit with no dust.
+        for mode in [RoundingMode::RoundDown, RoundingMode::RoundUp] {
+            let mut claimed = 0;
+            let mut previous = 0;
+            for t in 1..=3 {
+                let vested = interpolate_vested(t, 3, 7, mode);
+                assert!(vested >= previous);
+                claimed += vested - previous;
+                previous = vested;
+            }
+            assert_eq!(claimed, 7);
+        }
+    }
+
+    #[test]
+    fn round_down_never_exceeds_round_up() {
+        for elapsed in 0..=13 {
+            let down = interpolate_vested(elapsed, 13, 1_000_003, RoundingMode::RoundDown);
+            let up = interpolate_vested(elapsed, 13, 1_000_003, RoundingMode::RoundUp);
+            assert!(down <= up && up - down <= 1);
+        }
+    }
 
     #[test]
     fn rounding_extremes_never_exceed_deposit() {
         let rates: [i128; 8] = [
-            1,
-            2,
-            7,
-            1_000_000,
-            1_i128 << 32,
-            1_i128 << 64,
-            i128::MAX / 10_000,
-            i128::MAX / 2,
+            1, 2, 7, 1_000_000, 1_i128 << 32, 1_i128 << 64,
+            i128::MAX / 10_000, i128::MAX / 2,
         ];
         let durations: [u64; 8] = [1, 2, 3, 59, 60, 3_600, 86_400, 1_000_000];
-
         for rate in rates {
             for duration in durations {
                 match rate.checked_mul(duration as i128) {
@@ -445,14 +627,13 @@ mod tests {
                             assert!(accrued >= 0);
                         }
                     }
-                    None => {
-                        assert_eq!(
-                            calculate_streamed_amount(rate, duration),
-                            Err(Error::ArithmeticOverflow)
-                        );
-                    }
+                    None => assert_eq!(
+                        calculate_streamed_amount(rate, duration),
+                        Err(Error::ArithmeticOverflow)
+                    ),
                 }
             }
         }
     }
+
 }

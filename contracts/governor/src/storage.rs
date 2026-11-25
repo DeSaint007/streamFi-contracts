@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Env, Vec};
+use soroban_sdk::{contracttype, Address, Env, String, Vec};
 
 /// Proposal status.
 #[contracttype]
@@ -13,6 +13,21 @@ pub enum ProposalStatus {
     /// The proposal did not pass. Reserved for the status index so governance
     /// tooling can query the full lifecycle.
     Defeated = 4,
+    /// The proposal was vetoed by security guardian or emergency multisig.
+    Vetoed = 5,
+}
+
+/// Represents a single executable action within a proposal.
+/// Allows batching multiple contract calls in a single governance proposal (Issue #911).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Action {
+    /// Target contract address for this action.
+    pub target: Address,
+    /// Function selector/name to invoke on the target contract.
+    pub function: String,
+    /// Serialized parameters for the action execution.
+    pub params: Vec<u8>,
 }
 
 /// Historical token balance / voting weight checkpoint at a specific ledger sequence.
@@ -63,19 +78,41 @@ pub struct Proposal {
     pub for_votes: u64,
     /// Number of votes cast against.
     pub against_votes: u64,
+    /// Batched actions to execute atomically when proposal passes (Issue #911).
+    pub actions: Vec<Action>,
 }
 
-/// Protocol administration roles.
+/// Record of a proposal veto action by security guardian or emergency multisig (Issue #909).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalVeto {
+    /// Address of the guardian or multisig that vetoed the proposal.
+    pub guardian: Address,
+    /// IPFS hash or content identifier for the veto justification.
+    pub justification_hash: String,
+    /// Timestamp when the proposal was vetoed.
+    pub timestamp: u64,
+}
+
+/// Protocol administration roles with hierarchy enforcement (Issue #907).
 ///
 /// Each role gates a distinct slice of governor state, so independent wallets
 /// can own fee policy and rate/duration bounds without sharing a single
-/// all-powerful key:
+/// all-powerful key. Roles are organized in a hierarchy to prevent governance
+/// capture via compromised sub-admin keys:
 ///
-/// - `Admin`       — grant and revoke roles (including `Admin` itself).
+/// **Hierarchy (highest to lowest):**
+/// - `SuperAdmin`  — grant/revoke all roles including `SuperAdmin` itself (highest tier).
+/// - `Admin`       — grant and revoke roles except `SuperAdmin` (standard admin, cannot revoke super-admins).
 /// - `FeeManager`  — `set_fee_bps`, `set_fee_recipient`.
 /// - `RateManager` — `set_max_rate`, `set_min_duration`.
 /// - `Pauser`      — `governor_pause`, `governor_unpause`, `pause_factory`, `unpause_factory`.
-/// - `Executor`    — execute proposals after their timelock and quorum checks.
+/// - `Executor`    — execute proposals after their timelock and quorum checks (lowest tier).
+///
+/// **Revocation rules:**
+/// - Only `SuperAdmin` can revoke `SuperAdmin` or `Admin` roles.
+/// - `Admin` can revoke any role except `SuperAdmin` and other `Admin` roles.
+/// - Lower roles (`FeeManager`, `RateManager`, `Pauser`, `Executor`) can be revoked by `Admin` or `SuperAdmin`.
 ///
 /// A role may be held by any number of accounts, and one account may hold any
 /// combination of roles.
@@ -86,11 +123,14 @@ pub struct Proposal {
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
+    SuperAdmin,
     Admin,
     FeeManager,
     RateManager,
     Pauser,
     Executor,
+    /// May emergency-cancel queued (Pending or Active) proposals (Issue #968).
+    SecurityGuardian,
 }
 
 /// Composite key identifying a single (role, account) grant.
@@ -126,6 +166,9 @@ pub enum DataKey {
     /// Presence marks that `account` holds `role`. The stored value is an
     /// unused `bool`; membership is expressed entirely by the key existing.
     Role(RoleKey),
+    /// Number of accounts currently holding `Role::SuperAdmin`. Tracked so the last
+    /// super-admin can never be revoked, maintaining ultimate governance authority.
+    SuperAdminCount,
     /// Number of accounts currently holding `Role::Admin`. Tracked so the last
     /// admin can never be revoked, which would freeze governance permanently.
     AdminCount,
@@ -181,6 +224,8 @@ pub enum DataKey {
     VoteRecord(u64),
     /// Abstain-vote tally for proposal `u64`.
     ProposalAbstainVotes(u64),
+    /// Timelock delay in seconds between proposal creation and execution (Issue #967).
+    TimelockDelaySecs,
 }
 
 /// Adds `proposal_id` to the status index for `status` if it is not present.
@@ -408,4 +453,32 @@ pub fn record_voter_receipt(env: &Env, proposal_id: u64, voter: &Address, weight
     env.storage()
         .instance()
         .set(&DataKey::VoterReceipt(proposal_id, voter.clone()), &weight);
+}
+
+/// Records a veto action for a proposal with guardian address and justification hash (Issue #909).
+pub fn record_veto(env: &Env, proposal_id: u64, veto: &ProposalVeto) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ProposalVetoRecord(proposal_id), veto);
+}
+
+/// Retrieves the veto record for a proposal if it has been vetoed (Issue #909).
+pub fn get_veto_record(env: &Env, proposal_id: u64) -> Option<ProposalVeto> {
+    env.storage()
+        .instance()
+        .get(&DataKey::ProposalVetoRecord(proposal_id))
+}
+
+/// Saves the token supply snapshot at proposal creation for dynamic quorum calculations (Issue #910).
+pub fn save_token_supply_snapshot(env: &Env, proposal_id: u64, supply: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ProposalTokenSupplySnapshot(proposal_id), &supply);
+}
+
+/// Retrieves the token supply snapshot for dynamic quorum calculations (Issue #910).
+pub fn get_token_supply_snapshot(env: &Env, proposal_id: u64) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::ProposalTokenSupplySnapshot(proposal_id))
 }

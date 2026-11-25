@@ -192,6 +192,59 @@ pub fn topped_up_and_extended(
     );
 }
 
+/// Publish the schedule extension made by `top_up_and_extend` (#881), so
+/// indexers can tell a term prolongation apart from a plain principal top-up.
+pub fn top_up_extended(
+    env: &Env,
+    caller: &Address,
+    old_end_time: u64,
+    new_end_time: u64,
+    added_amount: i128,
+    new_total_deposit: i128,
+) {
+    assert_non_negative_amount(env, added_amount);
+    assert_non_negative_amount(env, new_total_deposit);
+
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (
+            Symbol::new(env, "StreamTopUpExtended"),
+            caller.clone(),
+            sequence,
+        ),
+        (old_end_time, new_end_time, added_amount, new_total_deposit),
+    );
+}
+
+/// Recipient granted `delegate` the right to call `claim_for` (#878).
+pub fn claim_delegate_set(env: &Env, recipient: &Address, delegate: &Address) {
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("claim_dlg"), recipient.clone(), sequence),
+        delegate.clone(),
+    );
+}
+
+/// Recipient revoked its claim delegate (#878).
+pub fn claim_delegate_revoked(env: &Env, recipient: &Address) {
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("rm_cl_dlg"), recipient.clone(), sequence),
+        (),
+    );
+}
+
+/// A delegate claimed `amount` for `recipient` through `claim_for` (#878).
+pub fn claimed_for(env: &Env, delegate: &Address, recipient: &Address, amount: i128) {
+    assert_non_negative_amount(env, amount);
+
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("claim_for"), delegate.clone(), sequence),
+        (recipient.clone(), amount),
+    );
+}
+
 /// Publish a prospective stream-rate change.
 pub fn rate_changed(env: &Env, caller: &Address, old_rate: i128, new_rate: i128) {
     assert_non_negative_amount(env, old_rate);
@@ -227,6 +280,30 @@ pub fn recipient_transferred(env: &Env, previous_recipient: &Address, new_recipi
     env.events().publish(
         (symbol_short!("xfer_rec"), previous_recipient.clone(), sequence),
         (previous_recipient.clone(), new_recipient.clone()),
+    );
+}
+
+pub fn recipient_transfer_proposed(
+    env: &Env,
+    current_recipient: &Address,
+    new_recipient: &Address,
+) {
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (
+            Symbol::new(env, "StreamRecipientTransferProposed"),
+            current_recipient.clone(),
+            sequence,
+        ),
+        (current_recipient.clone(), new_recipient.clone()),
+    );
+    env.events().publish(
+        (
+            symbol_short!("prop_rec"),
+            current_recipient.clone(),
+            sequence,
+        ),
+        (current_recipient.clone(), new_recipient.clone()),
     );
 }
 
@@ -434,5 +511,42 @@ pub fn funder_revoked(env: &Env, sender: &Address, funder: &Address) {
     env.events().publish(
         (symbol_short!("fund_rvk"), sender.clone(), sequence),
         funder.clone(),
+    );
+}
+
+/// Emitted when stream metadata or cancellation permissions are modified.
+///
+/// Topics: `("StreamConfigUpdated", caller, sequence)`
+/// Data:   `(old_rate_per_second, new_rate_per_second, old_end_time, new_end_time, old_cancel_delegated, new_cancel_delegated)`
+///
+/// Provides detailed telemetry for off-chain indexing observability on stream parameter changes.
+pub fn stream_config_updated(
+    env: &Env,
+    caller: &Address,
+    old_rate_per_second: i128,
+    new_rate_per_second: i128,
+    old_end_time: u64,
+    new_end_time: u64,
+    old_cancel_delegated: bool,
+    new_cancel_delegated: bool,
+) {
+    assert_non_negative_amount(env, old_rate_per_second);
+    assert_non_negative_amount(env, new_rate_per_second);
+
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (
+            Symbol::new(env, "StreamConfigUpdated"),
+            caller.clone(),
+            sequence,
+        ),
+        (
+            old_rate_per_second,
+            new_rate_per_second,
+            old_end_time,
+            new_end_time,
+            old_cancel_delegated,
+            new_cancel_delegated,
+        ),
     );
 }

@@ -100,6 +100,20 @@ pub const TTL_THRESHOLD: u32 = MIN_TTL_LEDGERS;
 /// Legacy alias for [`EXTEND_TTL_LEDGERS`].
 pub const TTL_EXTEND_TO: u32 = EXTEND_TTL_LEDGERS;
 
+/// Default instance storage TTL threshold (in ledgers) before extension occurs.
+///
+/// Equivalent to [`MIN_TTL_LEDGERS`]. Used for naming consistency across
+/// protocol contracts (stream, vault, batch-processor) to enforce uniform
+/// storage expiration policies.
+pub const DEFAULT_INSTANCE_THRESHOLD: u32 = MIN_TTL_LEDGERS;
+
+/// Default instance storage TTL bump target (in ledgers) when extended.
+///
+/// Equivalent to [`EXTEND_TTL_LEDGERS`]. Used for naming consistency across
+/// protocol contracts (stream, vault, batch-processor) to enforce uniform
+/// storage expiration policies.
+pub const DEFAULT_INSTANCE_BUMP: u32 = EXTEND_TTL_LEDGERS;
+
 /// Extends the contract's instance storage TTL to [`EXTEND_TTL_LEDGERS`] whenever
 /// the remaining TTL drops below [`MIN_TTL_LEDGERS`].
 ///

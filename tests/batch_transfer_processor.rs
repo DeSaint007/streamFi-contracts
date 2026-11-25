@@ -157,7 +157,7 @@ fn version_reports_the_current_behaviour_version() {
     let f = setup();
     // v4 adds the allowance-funded batch entry point. Bumped whenever
     // observable behaviour changes.
-    assert_eq!(f.client.version(), 4);
+    assert_eq!(f.client.version(), 5);
 }
 
 #[test]

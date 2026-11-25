@@ -33,6 +33,76 @@ fn configure_proposal_stake(
 }
 
 #[test]
+fn test_execution_rejected_before_timelock_and_allowed_after() {
+    let (env, authority, fee_recipient, factory_address) = create_test_env();
+    let contract_id = env.register_contract(None, DripGovernor);
+    let client = DripGovernorClient::new(&env, &contract_id);
+
+    client.initialize(&authority, &fee_recipient, &factory_address);
+    configure_proposal_stake(&env, &client, &authority);
+
+    // 7 days + 1 hour: above the MIN_EXECUTION_DELAY floor, so the configured value governs.
+    let timelock: u64 = 604_800 + 3_600;
+    client.set_timelock_delay(&authority, &timelock);
+    assert_eq!(client.config().timelock_delay_secs, timelock);
+
+    let created_at = env.ledger().timestamp();
+    let proposal_id = client.propose(&authority, &3600);
+
+    // Still inside the configured delay: rejected.
+    env.ledger().set_timestamp(created_at + timelock - 1);
+    assert_eq!(
+        client.try_execute_proposal(&authority, &proposal_id),
+        Err(Ok(Error::TimelockNotMet))
+    );
+
+    // Past the configured delay: allowed.
+    env.ledger().set_timestamp(created_at + timelock);
+    assert!(client.try_execute_proposal(&authority, &proposal_id).is_ok());
+}
+
+#[test]
+fn test_security_guardian_emergency_cancels_queued_proposal() {
+    let (env, authority, fee_recipient, factory_address) = create_test_env();
+    let contract_id = env.register_contract(None, DripGovernor);
+    let client = DripGovernorClient::new(&env, &contract_id);
+
+    client.initialize(&authority, &fee_recipient, &factory_address);
+    configure_proposal_stake(&env, &client, &authority);
+
+    let guardian = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    client.grant_role(&authority, &Role::SecurityGuardian, &guardian);
+
+    let proposal_id = client.propose(&authority, &3600);
+
+    // A non-guardian, including the admin, is rejected.
+    assert_eq!(
+        client.try_emergency_cancel_proposal(&outsider, &proposal_id),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.try_emergency_cancel_proposal(&authority, &proposal_id),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    // A guardian cancels the queued proposal.
+    assert!(client
+        .try_emergency_cancel_proposal(&guardian, &proposal_id)
+        .is_ok());
+    assert_eq!(
+        client.get_proposal(&proposal_id).status,
+        ProposalStatus::Cancelled
+    );
+
+    // Already cancelled: rejected.
+    assert_eq!(
+        client.try_emergency_cancel_proposal(&guardian, &proposal_id),
+        Err(Ok(Error::ProposalNotPending))
+    );
+}
+
+#[test]
 fn test_set_fee_bps_accepts_valid_values() {
     let (env, authority, fee_recipient, factory_address) = create_test_env();
     let contract_id = env.register_contract(None, DripGovernor);

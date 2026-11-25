@@ -50,4 +50,6 @@ pub enum Error {
     OraclePriceStale = 16,
     /// A submitted price moved more than the hard 50% sanity limit.
     OracleDeviationTooHigh = 24,
+    /// Price feed has stalled and no new data is available.
+    OracleFeedNotFound = 41,
 }

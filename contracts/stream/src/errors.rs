@@ -56,10 +56,21 @@ pub enum Error {
     StreamAlreadyCompleted = 34,
     /// The optional creation-time metadata URI exceeds 128 bytes (Issue #923).
     MetadataUriTooLong = 35,
+    /// Cliff timestamp is before `start_time` or after `end_time` (Issue #884).
+    InvalidCliffDuration = 36,
     /// `pause` was called on a stream that is already paused (#946).
     StreamAlreadyPaused = 120,
     /// `resume` was called on a stream that is not paused (#946).
     StreamNotPaused = 121,
     /// The caller is not an approved funder for this stream (#933).
     FunderNotApproved = 122,
+    /// A cliff timestamp is before stream inception or before the current ledger (#947).
+    CliffTimestampInvalid = 124,
+    /// The recipient is the all-zero Stellar address (#947).
+    RecipientInvalid = 125,
+    /// `bump_long_term_stream_ttl` was called on a stream that is not an
+    /// active multi-year schedule (#880).
+    StreamNotLongTerm = 123,
+    NoRecipientProposal = 126,
+    RecipientProposalStale = 127,
 }

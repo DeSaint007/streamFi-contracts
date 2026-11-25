@@ -113,6 +113,47 @@ pub fn stream_created(
     );
 }
 
+/// Payload for `StreamContractDeployed` (Issue #958).
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamContractDeployedPayload {
+    pub stream_id: u64,
+    pub sender: Address,
+    pub recipient: Address,
+    pub contract_address: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted once a stream contract is deployed and initialized by the factory
+/// (Issue #958). Lets indexers pick up new stream instances from events alone.
+///
+/// Topics: `("StreamContractDeployed", sender, recipient)`
+/// Data:   `StreamContractDeployedPayload { stream_id, sender, recipient,
+///          contract_address, timestamp }`
+pub fn stream_contract_deployed(
+    env: &Env,
+    stream_id: u64,
+    sender: &Address,
+    recipient: &Address,
+    contract_address: &Address,
+) {
+    let payload = StreamContractDeployedPayload {
+        stream_id,
+        sender: sender.clone(),
+        recipient: recipient.clone(),
+        contract_address: contract_address.clone(),
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(
+        (
+            Symbol::new(env, "StreamContractDeployed"),
+            sender.clone(),
+            recipient.clone(),
+        ),
+        payload,
+    );
+}
+
 /// Emitted when the hash used for future stream deployments changes.
 pub fn stream_contract_upgraded(env: &Env, old_wasm_hash: &BytesN<32>, new_wasm_hash: &BytesN<32>) {
     env.events().publish(
@@ -134,6 +175,22 @@ pub fn fee_update_executed(env: &Env, old_fee_bps: u32, new_fee_bps: u32) {
     env.events().publish(
         (Symbol::new(env, "fee_executed"),),
         (old_fee_bps, new_fee_bps),
+    );
+}
+
+/// Emitted when a protocol fee collector update is proposed under timelock (Issue #905).
+pub fn fee_collector_update_proposed(env: &Env, proposed_collector: &Address, eta_ledger: u32) {
+    env.events().publish(
+        (Symbol::new(env, "fee_collector_proposed"),),
+        (proposed_collector.clone(), eta_ledger),
+    );
+}
+
+/// Emitted when a timelocked protocol fee collector update is executed (Issue #905).
+pub fn fee_collector_update_executed(env: &Env, old_collector: &Address, new_collector: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "fee_collector_executed"),),
+        (old_collector.clone(), new_collector.clone()),
     );
 }
 

@@ -41,6 +41,46 @@ pub enum PausedError {
     ContractPaused,
 }
 
+/// Operation class for granular pause checks (Issue #1020).
+///
+/// Pass to [`require_operation_not_paused`] to enforce per-operation gate
+/// without reading flags the caller does not need.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PauseOperation {
+    /// New stream creation (`PauseFlags::PAUSE_CREATIONS`).
+    CreateStream,
+    /// Recipient withdrawal (`PauseFlags::PAUSE_WITHDRAWALS`).
+    Withdraw,
+    /// Deposit / fund intake (`PauseFlags::PAUSE_DEPOSITS`).
+    Deposit,
+}
+
+/// Granular gate: `Ok(())` when `operation` is not blocked by any active flag.
+///
+/// Preserves recipient access to already-vested funds during maintenance:
+///
+/// ```ignore
+/// // Block new streams but keep withdrawals open:
+/// let flags = PauseFlags::PAUSE_CREATIONS;
+/// require_operation_not_paused(flags, PauseOperation::CreateStream)?; // → Err
+/// require_operation_not_paused(flags, PauseOperation::Withdraw)?;     // → Ok
+/// ```
+pub fn require_operation_not_paused(
+    flags: PauseFlags,
+    operation: PauseOperation,
+) -> Result<(), PausedError> {
+    let blocked = match operation {
+        PauseOperation::CreateStream => flags.contains(PauseFlags::PAUSE_CREATIONS),
+        PauseOperation::Withdraw => flags.contains(PauseFlags::PAUSE_WITHDRAWALS),
+        PauseOperation::Deposit => flags.contains(PauseFlags::PAUSE_DEPOSITS),
+    };
+    if blocked {
+        Err(PausedError::ContractPaused)
+    } else {
+        Ok(())
+    }
+}
+
 /// Detailed pause state for emergency pause.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -684,4 +724,51 @@ mod pause_flag_tests {
         assert!(!dep.intersects(wd));
         assert!(!PauseFlags::empty().intersects(PauseFlags::ALL));
     }
+
+    #[test]
+    fn operation_pause_allows_withdrawals_while_creations_are_blocked() {
+        // Issue #1020: granular pause — block new streams but keep withdrawals open.
+        let flags = PauseFlags::PAUSE_CREATIONS;
+        assert_eq!(
+            require_operation_not_paused(flags, PauseOperation::CreateStream),
+            Err(PausedError::ContractPaused),
+        );
+        assert_eq!(
+            require_operation_not_paused(flags, PauseOperation::Withdraw),
+            Ok(()),
+        );
+        assert_eq!(
+            require_operation_not_paused(flags, PauseOperation::Deposit),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn all_flags_blocks_every_operation() {
+        for op in [
+            PauseOperation::CreateStream,
+            PauseOperation::Withdraw,
+            PauseOperation::Deposit,
+        ] {
+            assert_eq!(
+                require_operation_not_paused(PauseFlags::ALL, op),
+                Err(PausedError::ContractPaused),
+            );
+        }
+    }
+
+    #[test]
+    fn empty_flags_allows_every_operation() {
+        for op in [
+            PauseOperation::CreateStream,
+            PauseOperation::Withdraw,
+            PauseOperation::Deposit,
+        ] {
+            assert_eq!(
+                require_operation_not_paused(PauseFlags::empty(), op),
+                Ok(()),
+            );
+        }
+    }
 }
+ 

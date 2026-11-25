@@ -16,7 +16,8 @@ pub fn compute_salt(env: &Env, stream_id: u64) -> BytesN<32> {
         .into()
 }
 
-/// Derives a deterministic deployment salt from sender, recipient, nonce, and token (Issue #764).
+/// Derives a deterministic deployment salt from sender, recipient, nonce, token, ledger sequence, and timestamp (Issue #764).
+/// Incorporates ledger sequence and timestamp to prevent front-running and address collision.
 pub fn derive_salt(
     env: &Env,
     sender: &Address,
@@ -29,6 +30,15 @@ pub fn derive_salt(
     payload.append(&recipient.to_xdr(env));
     payload.append(&soroban_sdk::Bytes::from_array(env, &nonce.to_be_bytes()));
     payload.append(&token.to_xdr(env));
+    
+    // Append ledger sequence (u32 as 4 BE bytes) and timestamp (u64 as 8 BE bytes)
+    // to prevent pre-computation of the salt address before transaction inclusion.
+    let sequence = env.ledger().sequence();
+    payload.append(&soroban_sdk::Bytes::from_array(env, &sequence.to_be_bytes()));
+    
+    let timestamp = env.ledger().timestamp();
+    payload.append(&soroban_sdk::Bytes::from_array(env, &timestamp.to_be_bytes()));
+    
     env.crypto().sha256(&payload).into()
 }
 
@@ -63,16 +73,45 @@ pub fn deploy_stream_with_salt(
     Ok(addr)
 }
 
+/// Returns the sender's current deployment nonce and advances the stored
+/// counter (Issue #957).
+///
+/// The first deployment by a sender uses nonce `0`. The counter is a persistent
+/// entry keyed by sender, and its TTL is bumped on every write. Overflow fails
+/// with `ArithmeticOverflow` instead of wrapping, so a nonce is never reused.
+pub fn next_sender_nonce(env: &Env, sender: &Address) -> Result<u64, Error> {
+    let key = DataKey::SenderDeployNonce(sender.clone());
+    let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+    let next = current.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+    env.storage().persistent().set(&key, &next);
+    ttl::bump_persistent(env, &key);
+    Ok(current)
+}
+
+/// Deploys and initializes a stream contract with a sender-scoped salt
+/// (Issue #957), then emits `StreamContractDeployed` (Issue #958).
+///
+/// The salt is `derive_salt(sender, recipient, nonce, token)`, where `nonce` is
+/// the sender's next deployment nonce. Two users, or one user deploying twice,
+/// therefore never derive the same address.
+///
+/// Returns the stream address and the salt actually used. Callers must use the
+/// returned salt for any event or record that reports it.
+#[allow(clippy::too_many_arguments)]
 pub fn deploy_stream(
     env: &Env,
     wasm_hash: &BytesN<32>,
     stream_id: u64,
+    sender: &Address,
+    recipient: &Address,
+    token: &Address,
     init_args: Vec<Val>,
-) -> Result<Address, Error> {
-    // Derive a deterministic salt from the stream ID so each stream gets a
-    // unique, reproducible contract address.
-    let salt = compute_salt(env, stream_id);
-    deploy_stream_with_salt(env, wasm_hash, salt, init_args)
+) -> Result<(Address, BytesN<32>), Error> {
+    let nonce = next_sender_nonce(env, sender)?;
+    let salt = derive_salt(env, sender, recipient, nonce, token);
+    let addr = deploy_stream_with_salt(env, wasm_hash, salt.clone(), init_args)?;
+    events::stream_contract_deployed(env, stream_id, sender, recipient, &addr);
+    Ok((addr, salt))
 }
 
 /// Governance-guarded update of the WASM hash used for newly deployed streams.

@@ -60,7 +60,6 @@ pub fn extend_on_activity(env: &soroban_sdk::Env) {
         .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
 }
 
-/// Refresh persistent side-records whenever an active stream is withdrawn (#944).
 pub fn extend_persistent_on_activity(env: &soroban_sdk::Env) {
     for key in [
         crate::storage::DataKey::MetadataUri,
@@ -85,6 +84,85 @@ pub fn extend_stream_ttl(env: &soroban_sdk::Env) {
     } else {
         bump(env);
     }
+
+    // Keep persistent side records alive with the instance as well (#945).
+    for key in [
+        crate::storage::DataKey::MetadataUri,
+        crate::storage::DataKey::CancelledRecord,
+    ] {
+        if env.storage().persistent().has(&key) {
+            drip_common::ttl::bump_persistent(env, &key);
+        }
+    }
+}
+
+/// Emergency keeper renewal with caller-specified TTL threshold and extend
+/// target, guarded by protocol sanity bounds (Issue #887).
+///
+/// # Bounds
+/// - `min_ledgers_to_live > 0`
+/// - `ledgers_to_extend > 0`
+/// - `min_ledgers_to_live <= ledgers_to_extend`
+/// - `ledgers_to_extend <= MAX_TTL_LEDGERS`
+pub fn emergency_extend_custom(
+    env: &soroban_sdk::Env,
+    min_ledgers_to_live: u32,
+    ledgers_to_extend: u32,
+) -> Result<(), crate::errors::Error> {
+    if min_ledgers_to_live == 0
+        || ledgers_to_extend == 0
+        || min_ledgers_to_live > ledgers_to_extend
+        || ledgers_to_extend > MAX_TTL_LEDGERS
+    {
+        return Err(crate::errors::Error::InvalidAmount);
+    }
+    env.storage()
+        .instance()
+        .extend_ttl(min_ledgers_to_live, ledgers_to_extend);
+    Ok(())
+}
+
+/// Total schedule length (one year) from which a stream counts as a
+/// multi-year vesting schedule for `bump_long_term_stream_ttl` (#880).
+pub const LONG_TERM_STREAM_MIN_SECS: u64 = 31_536_000;
+
+/// Keeper heartbeat for multi-year vesting streams (#880).
+///
+/// Long grants can go months without a withdrawal, letting the instance TTL
+/// run out. Any relayer may call this to extend the instance TTL with the
+/// given threshold and target, so participants never need an emergency
+/// restore before withdrawing.
+///
+/// Only an active (not cancelled, not yet ended) bounded stream whose
+/// schedule spans at least [`LONG_TERM_STREAM_MIN_SECS`] qualifies; others
+/// get `StreamNotLongTerm`. Bounds match `emergency_extend_custom`.
+pub fn bump_long_term_stream_ttl(
+    env: &soroban_sdk::Env,
+    threshold: u32,
+    bump_ledgers: u32,
+) -> Result<(), crate::errors::Error> {
+    use crate::errors::Error;
+
+    if threshold == 0
+        || bump_ledgers == 0
+        || threshold > bump_ledgers
+        || bump_ledgers > MAX_TTL_LEDGERS
+    {
+        return Err(Error::InvalidAmount);
+    }
+
+    let info = crate::state::try_load(env)?;
+    crate::state::assert_not_cancelled(&info)?;
+    let schedule_secs = info.end_time.saturating_sub(info.start_time);
+    if info.end_time == 0
+        || schedule_secs < LONG_TERM_STREAM_MIN_SECS
+        || env.ledger().timestamp() >= info.end_time
+    {
+        return Err(Error::StreamNotLongTerm);
+    }
+
+    env.storage().instance().extend_ttl(threshold, bump_ledgers);
+    Ok(())
 }
 
 /// Low-cost keeper maintenance function for stream instances.
@@ -120,6 +198,48 @@ pub fn bump_stream_instance(
         0
     };
     bump_for_remaining(env, remaining);
+    Ok(())
+}
+
+/// Verifies that an active stream's persistent storage TTL is above the protocol minimum.
+///
+/// For long-running streams spanning multiple months, this ensures that critical
+/// persistent data entries (MetadataUri, CancelledRecord) maintain their TTL above
+/// the protocol threshold to prevent state expiration during extended periods of
+/// recipient inactivity.
+///
+/// # Arguments
+/// - `env` — Soroban environment
+/// - `threshold_ledgers` — Minimum acceptable remaining TTL in ledgers
+///
+/// # Returns
+/// - `Ok(())` if all persistent entries meet or exceed the threshold
+/// - `Err(Error::DataExpired)` if any persistent entry falls below threshold
+///
+/// # Note
+/// This helper should be called after stream interactions to verify that
+/// `extend_stream_ttl` or similar bumps have properly renewed persistent storage.
+pub fn verify_persistent_ttl_above_threshold(
+    env: &soroban_sdk::Env,
+    threshold_ledgers: u32,
+) -> Result<(), crate::errors::Error> {
+    use crate::storage::DataKey;
+
+    let keys_to_check = [
+        DataKey::MetadataUri,
+        DataKey::CancelledRecord,
+    ];
+
+    for key in &keys_to_check {
+        if env.storage().persistent().has(key) {
+            let remaining_ttl = env.storage().persistent().get_ttl(key)
+                .ok_or(crate::errors::Error::DataExpired)?;
+            if remaining_ttl < threshold_ledgers {
+                return Err(crate::errors::Error::DataExpired);
+            }
+        }
+    }
+
     Ok(())
 }
 
